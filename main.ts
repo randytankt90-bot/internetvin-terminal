@@ -1,14 +1,21 @@
 import { Plugin, ItemView, WorkspaceLeaf, App, TFile, setIcon, SuggestModal, Modal, Menu } from "obsidian";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import type { IPty } from "node-pty";
+import type { ChildProcess } from "child_process";
 
 const VIEW_TYPE = "vin-terminal-view";
 
-// Absolute path to the plugin's bundled node-pty package. Set in Plugin.onload
-// because Obsidian's renderer doesn't resolve bare requires against the
-// plugin's local node_modules — we must require by absolute path.
+// Paths resolved in Plugin.onload. node-pty cannot run in Obsidian's renderer
+// process (V8 doesn't allow Worker creation, which node-pty's Windows code
+// path requires). We sidestep this by spawning a child Node process via
+// process.execPath with ELECTRON_RUN_AS_NODE=1 — that child runs node-pty in
+// a normal Node context where Workers work, and the renderer talks to it
+// over stdio with a small control protocol.
 let nodePtyModulePath = "";
+let ptyHelperScriptPath = "";
+
+const PTY_CTRL_START = "\x1b]V;";
+const PTY_CTRL_END = "\x07";
 
 // Resolve a platform-appropriate default shell.
 // Honours VIN_TERM_SHELL env var as an override (useful for power users / testing).
@@ -672,7 +679,7 @@ class BookmarkManager {
 class TerminalSession {
   terminal: Terminal;
   fitAddon: FitAddon;
-  pty: IPty;
+  process: ChildProcess;
   containerEl: HTMLElement;
   id: number;
   name: string;
@@ -713,19 +720,15 @@ class TerminalSession {
     // Grab the hidden textarea xterm.js creates for input
     this.textareaEl = this.containerEl.querySelector(".xterm-helper-textarea");
 
-    // Spawn the shell in a real PTY via node-pty (cross-platform: ConPTY on
-    // Windows, openpty on macOS/Linux). node-pty is a native module — it must
-    // be installed as a runtime dependency next to main.js so require() finds
-    // its prebuilt bindings.
-    const nodePty = require(nodePtyModulePath);
-
-    // Strip CLAUDECODE env var so Claude Code can be launched inside the terminal.
+    // Spawn the shell via a child Node process (Electron-as-node) that hosts
+    // node-pty. We can't load node-pty in the renderer because its Windows
+    // code path requires Worker threads, which Obsidian's V8 disallows.
+    const { spawn } = require("child_process");
     const { CLAUDECODE, ...cleanEnv } = process.env;
-    this.pty = nodePty.spawn(shell, args, {
-      name: "xterm-256color",
-      cols: 80,
-      rows: 24,
-      cwd,
+
+    const helperConfig = JSON.stringify({
+      shell, args, cwd,
+      cols: 80, rows: 24,
       env: {
         ...cleanEnv,
         TERM: "xterm-256color",
@@ -733,9 +736,23 @@ class TerminalSession {
       },
     });
 
+    this.process = spawn(
+      process.execPath,
+      [ptyHelperScriptPath, nodePtyModulePath, helperConfig],
+      {
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      }
+    );
+
+    const writeToPty = (data: string) => {
+      try { this.process.stdin?.write(data); } catch {}
+    };
+
     // Wiki-link autocomplete
     this.autocomplete = new WikiLinkAutocomplete(
-      app, this.terminal, (data: string) => this.pty.write(data), this.containerEl
+      app, this.terminal, writeToPty, this.containerEl
     );
 
     // Bookmark manager
@@ -744,21 +761,27 @@ class TerminalSession {
     // Wire I/O
     this.terminal.onData((data) => {
       this.autocomplete?.handleData(data);
-      this.pty.write(data);
+      writeToPty(data);
     });
 
-    this.pty.onData((data: string) => {
+    this.process.stdout?.on("data", (data: Buffer) => {
       this.terminal.write(data);
       if (this._activityCallback) this._activityCallback(this);
     });
 
-    this.pty.onExit(() => {
+    this.process.stderr?.on("data", (data: Buffer) => {
+      // Helper-side error messages start with PTY_HELPER_ERROR; surface them
+      // in the terminal so the user can see what went wrong.
+      this.terminal.write(data);
+    });
+
+    this.process.on("exit", () => {
       this.terminal.write("\r\n[Process exited]\r\n");
     });
 
-    // When xterm.js changes cols/rows after a fit, tell the PTY directly.
+    // Resize via control sequence to the helper.
     this.terminal.onResize(({ cols, rows }) => {
-      try { this.pty.resize(cols, rows); } catch {}
+      writeToPty(`${PTY_CTRL_START}R;${cols};${rows}${PTY_CTRL_END}`);
     });
 
     // Initial fit after a tick (container needs to be laid out)
@@ -936,7 +959,7 @@ class TerminalSession {
 
     // Shell-escape paths and join with spaces
     const escaped = paths.map((p) => this.shellEscape(p)).join(" ");
-    this.pty.write(escaped);
+    try { this.process.stdin?.write(escaped); } catch {}
 
     // Show confirmation badge
     this.showDropBadge(paths);
@@ -968,7 +991,7 @@ class TerminalSession {
     if (saved.length === 0) return;
 
     const escaped = saved.map((p: string) => this.shellEscape(p)).join(" ");
-    this.pty.write(escaped);
+    try { this.process.stdin?.write(escaped); } catch {}
     this.showDropBadge(saved);
   }
 
@@ -1039,7 +1062,8 @@ class TerminalSession {
     this.bookmarkManager?.destroy();
     this.autocomplete?.destroy();
     try {
-      this.pty.kill();
+      try { this.process.stdin?.write(`${PTY_CTRL_START}K${PTY_CTRL_END}`); } catch {}
+      this.process.kill();
     } catch {
       // Already dead
     }
@@ -1904,11 +1928,15 @@ class OutputCaptureModal extends SuggestModal<CaptureOption> {
 
 export default class TerminalPlugin extends Plugin {
   async onload() {
-    // Resolve absolute path to the bundled node-pty (Obsidian's renderer
-    // can't find it via a bare require).
+    // Resolve absolute paths to the bundled node-pty package and the
+    // pty-helper.js child script. Both must be absolute because Obsidian's
+    // renderer doesn't resolve bare requires against the plugin folder, and
+    // the child process needs an absolute script path to run.
     const path = require("path");
     const vaultBase = (this.app.vault.adapter as any).basePath as string;
-    nodePtyModulePath = path.join(vaultBase, this.manifest.dir, "node_modules", "node-pty");
+    const pluginDir = path.join(vaultBase, this.manifest.dir);
+    nodePtyModulePath = path.join(pluginDir, "node_modules", "node-pty");
+    ptyHelperScriptPath = path.join(pluginDir, "pty-helper.js");
 
     this.registerView(VIEW_TYPE, (leaf) => new TerminalView(leaf));
 
