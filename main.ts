@@ -5,6 +5,11 @@ import type { IPty } from "node-pty";
 
 const VIEW_TYPE = "vin-terminal-view";
 
+// Absolute path to the plugin's bundled node-pty package. Set in Plugin.onload
+// because Obsidian's renderer doesn't resolve bare requires against the
+// plugin's local node_modules — we must require by absolute path.
+let nodePtyModulePath = "";
+
 // Resolve a platform-appropriate default shell.
 // Honours VIN_TERM_SHELL env var as an override (useful for power users / testing).
 // Windows: prefer Git Bash if installed, then PowerShell 7, then cmd/powershell.
@@ -712,7 +717,7 @@ class TerminalSession {
     // Windows, openpty on macOS/Linux). node-pty is a native module — it must
     // be installed as a runtime dependency next to main.js so require() finds
     // its prebuilt bindings.
-    const nodePty = require("node-pty");
+    const nodePty = require(nodePtyModulePath);
 
     // Strip CLAUDECODE env var so Claude Code can be launched inside the terminal.
     const { CLAUDECODE, ...cleanEnv } = process.env;
@@ -1899,6 +1904,12 @@ class OutputCaptureModal extends SuggestModal<CaptureOption> {
 
 export default class TerminalPlugin extends Plugin {
   async onload() {
+    // Resolve absolute path to the bundled node-pty (Obsidian's renderer
+    // can't find it via a bare require).
+    const path = require("path");
+    const vaultBase = (this.app.vault.adapter as any).basePath as string;
+    nodePtyModulePath = path.join(vaultBase, this.manifest.dir, "node_modules", "node-pty");
+
     this.registerView(VIEW_TYPE, (leaf) => new TerminalView(leaf));
 
     this.addRibbonIcon("terminal", "Open Terminal", () => {
