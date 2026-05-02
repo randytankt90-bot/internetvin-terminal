@@ -1,92 +1,46 @@
 import { Plugin, ItemView, WorkspaceLeaf, App, TFile, setIcon, SuggestModal, Modal, Menu } from "obsidian";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import type { ChildProcess } from "child_process";
+import type { IPty } from "node-pty";
 
 const VIEW_TYPE = "vin-terminal-view";
-let ptyHelperPath = "";
 
-const PTY_HELPER_PY = `\
-"""PTY helper for vin-terminal. Wraps zsh in a real PTY with resize support."""
-import os, select, signal, struct, fcntl, termios, pty
+// Resolve a platform-appropriate default shell.
+// Honours VIN_TERM_SHELL env var as an override (useful for power users / testing).
+// Windows: prefer Git Bash if installed, then PowerShell 7, then cmd/powershell.
+// macOS:   /bin/zsh.  Linux: $SHELL or /bin/bash.
+function resolveDefaultShell(): { shell: string; args: string[] } {
+  const fs = require("fs");
+  const override = process.env.VIN_TERM_SHELL;
+  if (override) return { shell: override, args: [] };
 
-def main():
-    cols = int(os.environ.get("VIN_TERM_COLS", "80"))
-    rows = int(os.environ.get("VIN_TERM_ROWS", "24"))
-    master, slave = pty.openpty()
-    fcntl.ioctl(master, termios.TIOCSWINSZ,
-                struct.pack("HHHH", rows, cols, 0, 0))
-    pid = os.fork()
-    if pid == 0:
-        os.close(master)
-        os.setsid()
-        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
-        os.dup2(slave, 0)
-        os.dup2(slave, 1)
-        os.dup2(slave, 2)
-        if slave > 2:
-            os.close(slave)
-        os.execvp("/bin/zsh", ["/bin/zsh", "-i", "-l"])
-    os.close(slave)
-    def resize(c, r):
-        fcntl.ioctl(master, termios.TIOCSWINSZ,
-                    struct.pack("HHHH", r, c, 0, 0))
-        os.kill(pid, signal.SIGWINCH)
-    buf = b""
-    SEQ_START = b"\\x1b]R;"
-    SEQ_END = b"\\x07"
-    try:
-        while True:
-            rlist, _, _ = select.select([0, master], [], [])
-            if 0 in rlist:
-                data = os.read(0, 4096)
-                if not data:
-                    break
-                buf += data
-                while SEQ_START in buf:
-                    idx = buf.index(SEQ_START)
-                    end = buf.find(SEQ_END, idx)
-                    if end < 0:
-                        if idx > 0:
-                            os.write(master, buf[:idx])
-                        buf = buf[idx:]
-                        break
-                    if idx > 0:
-                        os.write(master, buf[:idx])
-                    seq = buf[idx + len(SEQ_START):end]
-                    buf = buf[end + 1:]
-                    try:
-                        parts = seq.split(b";")
-                        if len(parts) == 2:
-                            resize(int(parts[0]), int(parts[1]))
-                    except (ValueError, IndexError):
-                        pass
-                else:
-                    if buf:
-                        os.write(master, buf)
-                        buf = b""
-            if master in rlist:
-                try:
-                    data = os.read(master, 4096)
-                    if not data:
-                        break
-                    os.write(1, data)
-                except OSError:
-                    break
-    except Exception:
-        pass
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        os.waitpid(pid, 0)
-    except ChildProcessError:
-        pass
+  if (process.platform === "win32") {
+    const gitBash = [
+      "C:\\Program Files\\Git\\bin\\bash.exe",
+      "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+    ];
+    for (const c of gitBash) {
+      try { if (fs.existsSync(c)) return { shell: c, args: ["-i", "-l"] }; } catch {}
+    }
+    try {
+      if (fs.existsSync("C:\\Program Files\\PowerShell\\7\\pwsh.exe")) {
+        return { shell: "C:\\Program Files\\PowerShell\\7\\pwsh.exe", args: ["-NoLogo"] };
+      }
+    } catch {}
+    return { shell: "powershell.exe", args: ["-NoLogo"] };
+  }
 
-if __name__ == "__main__":
-    main()
-`;
+  if (process.platform === "darwin") {
+    return { shell: "/bin/zsh", args: ["-i", "-l"] };
+  }
+  return { shell: process.env.SHELL || "/bin/bash", args: ["-i", "-l"] };
+}
+
+function shellDisplayName(shellPath: string): string {
+  const path = require("path");
+  const base = path.basename(shellPath).replace(/\.exe$/i, "");
+  return base || "shell";
+}
 
 // --- Theme helpers ---
 // Build an xterm.js ITheme from Obsidian's CSS variables at runtime.
@@ -713,7 +667,7 @@ class BookmarkManager {
 class TerminalSession {
   terminal: Terminal;
   fitAddon: FitAddon;
-  process: ChildProcess;
+  pty: IPty;
   containerEl: HTMLElement;
   id: number;
   name: string;
@@ -729,7 +683,8 @@ class TerminalSession {
 
   constructor(parent: HTMLElement, id: number, cwd: string, app: App) {
     this.id = id;
-    this.name = `zsh ${id}`;
+    const { shell, args } = resolveDefaultShell();
+    this.name = `${shellDisplayName(shell)} ${id}`;
     this.app = app;
 
     this.containerEl = parent.createDiv({ cls: "vin-terminal-session" });
@@ -753,27 +708,29 @@ class TerminalSession {
     // Grab the hidden textarea xterm.js creates for input
     this.textareaEl = this.containerEl.querySelector(".xterm-helper-textarea");
 
-    // Spawn zsh inside a real PTY via Python helper.
-    // The helper accepts resize commands so the shell reflows to fit the panel.
-    const { spawn } = require("child_process");
-    const helperScript = ptyHelperPath;
+    // Spawn the shell in a real PTY via node-pty (cross-platform: ConPTY on
+    // Windows, openpty on macOS/Linux). node-pty is a native module — it must
+    // be installed as a runtime dependency next to main.js so require() finds
+    // its prebuilt bindings.
+    const nodePty = require("node-pty");
 
-    // Strip CLAUDECODE env var so Claude Code can be launched inside the terminal
+    // Strip CLAUDECODE env var so Claude Code can be launched inside the terminal.
     const { CLAUDECODE, ...cleanEnv } = process.env;
-    this.process = spawn("python3", [helperScript], {
+    this.pty = nodePty.spawn(shell, args, {
+      name: "xterm-256color",
+      cols: 80,
+      rows: 24,
       cwd,
       env: {
         ...cleanEnv,
         TERM: "xterm-256color",
-        LANG: "en_US.UTF-8",
-        VIN_TERM_COLS: "80",
-        VIN_TERM_ROWS: "24",
+        LANG: cleanEnv.LANG || "en_US.UTF-8",
       },
     });
 
     // Wiki-link autocomplete
     this.autocomplete = new WikiLinkAutocomplete(
-      app, this.terminal, (data: string) => this.process.stdin?.write(data), this.containerEl
+      app, this.terminal, (data: string) => this.pty.write(data), this.containerEl
     );
 
     // Bookmark manager
@@ -782,25 +739,21 @@ class TerminalSession {
     // Wire I/O
     this.terminal.onData((data) => {
       this.autocomplete?.handleData(data);
-      this.process.stdin?.write(data);
+      this.pty.write(data);
     });
 
-    this.process.stdout?.on("data", (data: Buffer) => {
+    this.pty.onData((data: string) => {
       this.terminal.write(data);
       if (this._activityCallback) this._activityCallback(this);
     });
 
-    this.process.stderr?.on("data", (data: Buffer) => {
-      this.terminal.write(data);
-    });
-
-    this.process.on("exit", () => {
+    this.pty.onExit(() => {
       this.terminal.write("\r\n[Process exited]\r\n");
     });
 
-    // When xterm.js changes cols/rows after a fit, tell the PTY
+    // When xterm.js changes cols/rows after a fit, tell the PTY directly.
     this.terminal.onResize(({ cols, rows }) => {
-      this.process.stdin?.write(`\x1b]R;${cols};${rows}\x07`);
+      try { this.pty.resize(cols, rows); } catch {}
     });
 
     // Initial fit after a tick (container needs to be laid out)
@@ -978,7 +931,7 @@ class TerminalSession {
 
     // Shell-escape paths and join with spaces
     const escaped = paths.map((p) => this.shellEscape(p)).join(" ");
-    this.process.stdin?.write(escaped);
+    this.pty.write(escaped);
 
     // Show confirmation badge
     this.showDropBadge(paths);
@@ -1010,7 +963,7 @@ class TerminalSession {
     if (saved.length === 0) return;
 
     const escaped = saved.map((p: string) => this.shellEscape(p)).join(" ");
-    this.process.stdin?.write(escaped);
+    this.pty.write(escaped);
     this.showDropBadge(saved);
   }
 
@@ -1081,7 +1034,7 @@ class TerminalSession {
     this.bookmarkManager?.destroy();
     this.autocomplete?.destroy();
     try {
-      this.process.kill("SIGTERM");
+      this.pty.kill();
     } catch {
       // Already dead
     }
@@ -1946,16 +1899,6 @@ class OutputCaptureModal extends SuggestModal<CaptureOption> {
 
 export default class TerminalPlugin extends Plugin {
   async onload() {
-    // Ensure pty-helper.py exists in the plugin directory.
-    // BRAT and Obsidian's plugin installer only copy main.js, manifest.json,
-    // and styles.css, so we write it ourselves on every load.
-    const fs = require("fs");
-    const path = require("path");
-    const vaultBase = (this.app.vault.adapter as any).basePath as string;
-    const helperPath = path.join(vaultBase, this.manifest.dir, "pty-helper.py");
-    fs.writeFileSync(helperPath, PTY_HELPER_PY, { mode: 0o755 });
-    ptyHelperPath = helperPath;
-
     this.registerView(VIEW_TYPE, (leaf) => new TerminalView(leaf));
 
     this.addRibbonIcon("terminal", "Open Terminal", () => {

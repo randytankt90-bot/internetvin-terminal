@@ -4,7 +4,7 @@ esbuild.build({
   entryPoints: ["main.ts"],
   bundle: true,
   outfile: "main.js",
-  external: ["obsidian", "electron", "child_process"],
+  external: ["obsidian", "electron", "child_process", "node-pty"],
   format: "cjs",
   platform: "node",
   target: "es2020",
