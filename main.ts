@@ -736,11 +736,16 @@ class TerminalSession {
       },
     });
 
+    // Spawn a real Node.js binary from PATH. We can't use Obsidian's own
+    // executable with ELECTRON_RUN_AS_NODE=1: Obsidian's launcher treats the
+    // script path as a CLI command and routes it back to the running instance
+    // ("Received CLI command"). A standalone Node.js install is required.
+    const nodeBin = process.env.VIN_TERM_NODE
+      || (process.platform === "win32" ? "node.exe" : "node");
     this.process = spawn(
-      process.execPath,
+      nodeBin,
       [ptyHelperScriptPath, nodePtyModulePath, helperConfig],
       {
-        env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
       }
@@ -777,6 +782,9 @@ class TerminalSession {
 
     this.process.on("exit", () => {
       this.terminal.write("\r\n[Process exited]\r\n");
+    });
+    this.process.on("error", (err: Error) => {
+      this.terminal.write(`\r\n[spawn error] ${err.message}\r\nIs Node.js installed and on PATH? Set VIN_TERM_NODE to override.\r\n`);
     });
 
     // Resize via control sequence to the helper.
